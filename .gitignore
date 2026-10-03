@@ -1,0 +1,27 @@
+# Private keys and certificate material
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Environment and local secret files
+.env
+.env.*
+!.env.example
+.vault_password
+.vault_pass
+vault_password
+*.vault-pass
+secrets.yml
+secrets.yaml
+
+# Ansible runtime artifacts
+*.retry
+ansible/*.retry
+
+# Local Python tooling
+.venv/
+__pycache__/
+*.py[cod]

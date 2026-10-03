@@ -1,0 +1,87 @@
+name: Validate and deploy Ansible
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Ansible and application syntax
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ansible
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Ansible
+        run: python -m pip install --disable-pip-version-check ansible-core
+
+      - name: Check Ansible playbook syntax
+        run: |
+          ansible-playbook -i inventory.ini mariadb.yml --syntax-check
+          ansible-playbook -i inventory.ini app.yml --syntax-check
+          ansible-playbook -i inventory.ini monitoring.yml --syntax-check
+
+      - name: Check application syntax
+        run: python -m py_compile files/app.py
+
+  deploy:
+    name: Deploy production
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: ansible
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Ansible
+        run: python -m pip install --disable-pip-version-check ansible-core
+
+      - name: Configure SSH and Ansible Vault
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.EC2_SSH_KNOWN_HOSTS }}
+          VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ansible_ssh_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          printf '%s' "$VAULT_PASSWORD" > "$RUNNER_TEMP/ansible_vault_password"
+          chmod 600 "$RUNNER_TEMP/ansible_ssh_key" "$RUNNER_TEMP/ansible_vault_password" "$HOME/.ssh/known_hosts"
+
+      - name: Deploy MariaDB
+        run: ansible-playbook -i inventory.ini mariadb.yml --private-key "$RUNNER_TEMP/ansible_ssh_key" --vault-password-file "$RUNNER_TEMP/ansible_vault_password"
+
+      - name: Deploy application
+        run: ansible-playbook -i inventory.ini app.yml --private-key "$RUNNER_TEMP/ansible_ssh_key" --vault-password-file "$RUNNER_TEMP/ansible_vault_password"
+
+      - name: Deploy monitoring
+        run: ansible-playbook -i inventory.ini monitoring.yml --private-key "$RUNNER_TEMP/ansible_ssh_key" --vault-password-file "$RUNNER_TEMP/ansible_vault_password"
+
+      - name: Remove runtime credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ansible_ssh_key" "$RUNNER_TEMP/ansible_vault_password" "$HOME/.ssh/known_hosts"

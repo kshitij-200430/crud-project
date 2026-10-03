@@ -1,0 +1,14 @@
+[Unit]
+Description=CRUD Flask App
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/crud-app
+EnvironmentFile=/home/ec2-user/crud-app/.env
+ExecStart=/usr/bin/python3 /home/ec2-user/crud-app/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

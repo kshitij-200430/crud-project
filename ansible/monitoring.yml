@@ -1,0 +1,560 @@
+---
+# monitoring.yml
+#   1. node_exporter     -> every VM (app, db, monitoring)
+#   2. mysqld_exporter   -> db VMs (user created on the primary, replicates to replicas)
+#   3. Prometheus + Alertmanager + Grafana (+ swap) -> monitoring VM
+#
+# Needs in inventory.ini:
+#   - a [monitoring] group
+#   - private_ip on EVERY host (Prometheus scrapes private IPs)
+#   - exporter_db_pass in group_vars/all/vault.yml
+#
+# Run: ansible-playbook -i inventory.ini monitoring.yml
+
+# ---------------------------------------------------------------
+# 1. node_exporter on all VMs
+# ---------------------------------------------------------------
+- name: Install node_exporter
+  hosts: all
+  become: true
+  vars:
+    node_exporter_version: "1.8.2"
+  tasks:
+    - name: Create node_exporter user
+      ansible.builtin.user:
+        name: node_exporter
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Download and unpack node_exporter
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+
+    - name: Install node_exporter binary
+      ansible.builtin.copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        remote_src: true
+        owner: root
+        mode: "0755"
+      notify: restart node_exporter
+
+    - name: Install node_exporter systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=node_exporter
+          ExecStart=/usr/local/bin/node_exporter
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart node_exporter
+
+    - name: Enable and start node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Check node_exporter responds
+      ansible.builtin.uri:
+        url: http://localhost:9100/metrics
+        status_code: 200
+        return_content: false
+      register: ne_check
+      until: ne_check.status == 200
+      retries: 5
+      delay: 2
+
+  handlers:
+    - name: restart node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: true
+
+# ---------------------------------------------------------------
+# 2a. Create the low-privilege exporter user on the PRIMARY only.
+#     It replicates to db2/db3 through normal replication.
+#     Assumes root can run `sudo mysql` without a password (socket auth).
+# ---------------------------------------------------------------
+- name: Create mysqld_exporter DB user on primary
+  hosts: db_primary
+  become: true
+  tasks:
+    - name: Create exporter user and grants
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - -e
+          - >-
+            CREATE USER IF NOT EXISTS 'exporter'@'localhost' IDENTIFIED BY '{{ exporter_db_pass }}';
+            CREATE USER IF NOT EXISTS 'exporter'@'127.0.0.1' IDENTIFIED BY '{{ exporter_db_pass }}';
+            GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
+            GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'127.0.0.1';
+            FLUSH PRIVILEGES;
+      changed_when: false
+      no_log: true
+
+# ---------------------------------------------------------------
+# 2b. mysqld_exporter on all DB VMs
+# ---------------------------------------------------------------
+- name: Install mysqld_exporter
+  hosts: db
+  become: true
+  vars:
+    mysqld_exporter_version: "0.15.1"
+  tasks:
+    - name: Wait until the exporter user exists on this node (replication)
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - -N
+          - -e
+          - "SELECT COUNT(*) FROM mysql.user WHERE User='exporter'"
+      register: exporter_user_count
+      until: exporter_user_count.stdout | trim == '2'
+      retries: 15
+      delay: 2
+      changed_when: false
+
+    - name: Create mysqld_exporter system user
+      ansible.builtin.user:
+        name: mysqld_exporter
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Download and unpack mysqld_exporter
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus/mysqld_exporter/releases/download/v{{ mysqld_exporter_version }}/mysqld_exporter-{{ mysqld_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/mysqld_exporter-{{ mysqld_exporter_version }}.linux-amd64/mysqld_exporter"
+
+    - name: Install mysqld_exporter binary
+      ansible.builtin.copy:
+        src: "/tmp/mysqld_exporter-{{ mysqld_exporter_version }}.linux-amd64/mysqld_exporter"
+        dest: /usr/local/bin/mysqld_exporter
+        remote_src: true
+        owner: root
+        mode: "0755"
+      notify: restart mysqld_exporter
+
+    - name: Write mysqld_exporter credentials file
+      ansible.builtin.copy:
+        dest: /etc/mysqld_exporter.cnf
+        owner: root
+        group: mysqld_exporter
+        mode: "0640"
+        content: |
+          [client]
+          user=exporter
+          password={{ exporter_db_pass }}
+          host=127.0.0.1
+          port=3306
+      notify: restart mysqld_exporter
+      no_log: true
+
+    - name: Install mysqld_exporter systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysqld_exporter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus MySQL/MariaDB Exporter
+          After=network-online.target mariadb.service
+          Wants=network-online.target
+
+          [Service]
+          User=mysqld_exporter
+          ExecStart=/usr/local/bin/mysqld_exporter \
+            --config.my-cnf=/etc/mysqld_exporter.cnf \
+            --web.listen-address=:9104
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart mysqld_exporter
+
+    - name: Enable and start mysqld_exporter
+      ansible.builtin.systemd:
+        name: mysqld_exporter
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Check mysqld_exporter responds
+      ansible.builtin.uri:
+        url: http://localhost:9104/metrics
+        status_code: 200
+        return_content: false
+      register: me_check
+      until: me_check.status == 200
+      retries: 5
+      delay: 2
+
+  handlers:
+    - name: restart mysqld_exporter
+      ansible.builtin.systemd:
+        name: mysqld_exporter
+        state: restarted
+        daemon_reload: true
+
+# ---------------------------------------------------------------
+# 3. Monitoring VM: swap, Prometheus, Alertmanager, Grafana
+# ---------------------------------------------------------------
+- name: Set up monitoring server
+  hosts: monitoring
+  become: true
+  vars:
+    prometheus_version: "2.54.1"
+    alertmanager_version: "0.27.0"
+    node_targets: "{{ groups['all'] | map('extract', hostvars, 'private_ip') | map('regex_replace', '$', ':9100') | list }}"
+    mysql_targets: "{{ groups['db'] | map('extract', hostvars, 'private_ip') | map('regex_replace', '$', ':9104') | list }}"
+  tasks:
+    # ---- swap (t2.micro has only 1 GB RAM) ----
+    - name: Create and enable 1 GB swap file
+      ansible.builtin.shell: |
+        set -e
+        dd if=/dev/zero of=/swapfile bs=1M count=1024
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      args:
+        creates: /swapfile
+
+    # ---- Prometheus ----
+    - name: Create prometheus user
+      ansible.builtin.user:
+        name: prometheus
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Create Prometheus directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+
+    - name: Download and unpack Prometheus
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+
+    - name: Install Prometheus binaries
+      ansible.builtin.copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        remote_src: true
+        owner: root
+        mode: "0755"
+      loop:
+        - prometheus
+        - promtool
+      notify: restart prometheus
+
+    - name: Write Prometheus alert rules
+      ansible.builtin.copy:
+        dest: /etc/prometheus/alerts.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+        validate: /usr/local/bin/promtool check rules %s
+        content: |
+          groups:
+            - name: infrastructure
+              rules:
+                - alert: InstanceDown
+                  expr: up == 0
+                  for: 1m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "A scrape target is down (see the instance label)"
+
+                - alert: DiskAlmostFull
+                  expr: (node_filesystem_avail_bytes{fstype=~"xfs|ext4"} / node_filesystem_size_bytes{fstype=~"xfs|ext4"}) < 0.15
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Less than 15% disk space left (see the instance label)"
+
+                - alert: LowMemory
+                  expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Less than 10% memory available (see the instance label)"
+
+            - name: mariadb
+              rules:
+                - alert: MariaDBDown
+                  expr: mysql_up == 0
+                  for: 1m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "MariaDB is not responding (see the instance label)"
+
+                - alert: ReplicationStopped
+                  expr: (mysql_slave_status_slave_io_running == 0) or (mysql_slave_status_slave_sql_running == 0)
+                  for: 1m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Replication IO or SQL thread stopped (see the instance label)"
+
+                - alert: ReplicationLagHigh
+                  expr: mysql_slave_status_seconds_behind_master > 30
+                  for: 2m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Replica is more than 30s behind the primary (see the instance label)"
+      notify: restart prometheus
+
+    - name: Write Prometheus config
+      ansible.builtin.copy:
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+        validate: /usr/local/bin/promtool check config %s
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+
+          rule_files:
+            - /etc/prometheus/alerts.yml
+
+          alerting:
+            alertmanagers:
+              - static_configs:
+                  - targets: ["localhost:9093"]
+
+          scrape_configs:
+            - job_name: prometheus
+              static_configs:
+                - targets: ["localhost:9090"]
+
+            - job_name: node
+              static_configs:
+                - targets: {{ node_targets | to_json }}
+
+            - job_name: mariadb
+              static_configs:
+                - targets: {{ mysql_targets | to_json }}
+      notify: restart prometheus
+
+    - name: Install Prometheus systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prometheus.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=prometheus
+          ExecStart=/usr/local/bin/prometheus \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/var/lib/prometheus \
+            --storage.tsdb.retention.time=7d \
+            --web.listen-address=0.0.0.0:9090
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart prometheus
+
+    - name: Enable and start Prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ---- Alertmanager ----
+    - name: Create alertmanager user
+      ansible.builtin.user:
+        name: alertmanager
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Create Alertmanager directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: alertmanager
+        group: alertmanager
+        mode: "0755"
+      loop:
+        - /etc/alertmanager
+        - /var/lib/alertmanager
+
+    - name: Download and unpack Alertmanager
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus/alertmanager/releases/download/v{{ alertmanager_version }}/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/alertmanager"
+
+    - name: Install Alertmanager binaries
+      ansible.builtin.copy:
+        src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        remote_src: true
+        owner: root
+        mode: "0755"
+      loop:
+        - alertmanager
+        - amtool
+      notify: restart alertmanager
+
+    - name: Write Alertmanager config (UI-only for now)
+      ansible.builtin.copy:
+        dest: /etc/alertmanager/alertmanager.yml
+        owner: alertmanager
+        group: alertmanager
+        mode: "0640"
+        content: |
+          route:
+            receiver: default
+            group_by: ["alertname", "instance"]
+            group_wait: 30s
+            group_interval: 5m
+            repeat_interval: 4h
+
+          receivers:
+            - name: default
+              # Add a notification channel here later, e.g. email_configs or slack_configs.
+      notify: restart alertmanager
+
+    - name: Install Alertmanager systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/alertmanager.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Alertmanager
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=alertmanager
+          ExecStart=/usr/local/bin/alertmanager \
+            --config.file=/etc/alertmanager/alertmanager.yml \
+            --storage.path=/var/lib/alertmanager \
+            --web.listen-address=0.0.0.0:9093
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart alertmanager
+
+    - name: Enable and start Alertmanager
+      ansible.builtin.systemd:
+        name: alertmanager
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ---- Grafana ----
+    - name: Add Grafana yum repo
+      ansible.builtin.yum_repository:
+        name: grafana
+        description: Grafana OSS
+        baseurl: https://rpm.grafana.com
+        gpgcheck: true
+        gpgkey: https://rpm.grafana.com/gpg.key
+        repo_gpgcheck: true
+        sslverify: true
+        sslcacert: /etc/pki/tls/certs/ca-bundle.crt
+
+    - name: Install Grafana
+      ansible.builtin.dnf:
+        name: grafana
+        state: present
+
+    - name: Provision Prometheus datasource
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        owner: root
+        group: grafana
+        mode: "0640"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://localhost:9090
+              isDefault: true
+      notify: restart grafana
+
+    - name: Enable and start Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        enabled: true
+        state: started
+
+    # ---- verification ----
+    - name: Verify Prometheus, Alertmanager and Grafana are up
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        status_code: 200
+      register: stack_check
+      until: stack_check.status == 200
+      retries: 10
+      delay: 3
+      loop:
+        - http://localhost:9090/-/ready
+        - http://localhost:9093/-/ready
+        - http://localhost:3000/api/health
+
+  handlers:
+    - name: restart prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        state: restarted
+        daemon_reload: true
+
+    - name: restart alertmanager
+      ansible.builtin.systemd:
+        name: alertmanager
+        state: restarted
+        daemon_reload: true
+
+    - name: restart grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted

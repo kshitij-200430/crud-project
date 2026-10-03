@@ -1,0 +1,144 @@
+---
+# ============================================================
+# Play 1: Install + configure PRIMARY
+# ============================================================
+- hosts: db_primary
+  become: true
+  tasks:
+    - name: Install MariaDB server
+      dnf:
+        name: mariadb105-server
+        state: present
+
+    - name: Start and enable MariaDB
+      systemd:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Configure primary (server-id, binlog)
+      blockinfile:
+        path: /etc/my.cnf.d/mariadb-server.cnf
+        marker: "# {mark} ANSIBLE MANAGED - REPLICATION"
+        insertafter: "^\\[mysqld\\]"
+        block: |
+          server-id=1
+          log-bin=mysql-bin
+          bind-address=0.0.0.0
+      register: primary_cnf
+
+    - name: Restart MariaDB after config change
+      systemd:
+        name: mariadb
+        state: restarted
+      when: primary_cnf.changed
+
+    - name: Create replication user
+      command: >
+        mysql -u root -e
+        "CREATE USER IF NOT EXISTS '{{ repl_user }}'@'%' IDENTIFIED BY '{{ repl_pass }}';
+        GRANT REPLICATION SLAVE ON *.* TO '{{ repl_user }}'@'%';
+        FLUSH PRIVILEGES;"
+      changed_when: true
+      no_log: true
+
+    - name: Create app database
+      command: >
+        mysql -u root -e
+        "CREATE DATABASE IF NOT EXISTS {{ app_db_name }};"
+      changed_when: true
+
+    - name: Create app user with full access to app db
+      command: >
+        mysql -u root -e
+        "CREATE USER IF NOT EXISTS '{{ app_db_user }}'@'%' IDENTIFIED BY '{{ app_db_pass }}';
+        GRANT ALL PRIVILEGES ON {{ app_db_name }}.* TO '{{ app_db_user }}'@'%';
+        FLUSH PRIVILEGES;"
+      changed_when: true
+      no_log: true
+
+    - name: Get master status (binlog file + position)
+      command: mysql -u root -e "SHOW MASTER STATUS\G"
+      register: master_status_raw
+      changed_when: false
+
+    - name: Show raw master status output (debug)
+      debug:
+        msg: "{{ master_status_raw.stdout }}"
+
+    - name: Parse master log file and position
+      set_fact:
+        master_log_file: "{{ master_status_raw.stdout | regex_search('File:\\s*(\\S+)', '\\1') | first }}"
+        master_log_pos: "{{ master_status_raw.stdout | regex_search('Position:\\s*(\\S+)', '\\1') | first }}"
+
+    - name: Show parsed binlog coordinates
+      debug:
+        msg: "Primary binlog file={{ master_log_file }} position={{ master_log_pos }}"
+
+# ============================================================
+# Play 2: Install + configure REPLICAS, point them at primary
+# ============================================================
+- hosts: db_replicas
+  become: true
+  vars:
+    primary_private_ip: "{{ hostvars[groups['db_primary'][0]]['private_ip'] }}"
+    master_log_file: "{{ hostvars[groups['db_primary'][0]]['master_log_file'] }}"
+    master_log_pos: "{{ hostvars[groups['db_primary'][0]]['master_log_pos'] }}"
+  tasks:
+    - name: Install MariaDB server
+      dnf:
+        name: mariadb105-server
+        state: present
+
+    - name: Start and enable MariaDB
+      systemd:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Configure replica (unique server-id, read_only)
+      blockinfile:
+        path: /etc/my.cnf.d/mariadb-server.cnf
+        marker: "# {mark} ANSIBLE MANAGED - REPLICATION"
+        insertafter: "^\\[mysqld\\]"
+        block: |
+          server-id={{ server_id }}
+          bind-address=0.0.0.0
+          read_only=1
+      register: replica_cnf
+
+    - name: Restart MariaDB after config change
+      systemd:
+        name: mariadb
+        state: restarted
+      when: replica_cnf.changed
+
+    - name: Stop any existing replication (safe if none running)
+      command: mysql -u root -e "STOP SLAVE;"
+      changed_when: false
+      failed_when: false
+
+    - name: Point replica at primary
+      command: >
+        mysql -u root -e
+        "CHANGE MASTER TO
+        MASTER_HOST='{{ primary_private_ip }}',
+        MASTER_USER='{{ repl_user }}',
+        MASTER_PASSWORD='{{ repl_pass }}',
+        MASTER_LOG_FILE='{{ master_log_file }}',
+        MASTER_LOG_POS={{ master_log_pos }};"
+      changed_when: true
+      no_log: true
+
+    - name: Start replication
+      command: mysql -u root -e "START SLAVE;"
+      changed_when: true
+
+    - name: Check replica status
+      command: mysql -u root -e "SHOW SLAVE STATUS\G"
+      register: slave_status
+      changed_when: false
+
+    - name: Show replica status output
+      debug:
+        msg: "{{ slave_status.stdout_lines }}"

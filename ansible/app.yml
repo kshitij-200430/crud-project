@@ -1,0 +1,77 @@
+---
+- hosts: app
+  become: true
+  vars:
+    primary_ip: "{{ hostvars[groups['db_primary'][0]]['private_ip'] }}"
+    replica_ips: "{{ groups['db_replicas'] | map('extract', hostvars, 'private_ip') | join(',') }}"
+  tasks:
+    - name: Install Python3 and pip
+      dnf:
+        name:
+          - python3
+          - python3-pip
+        state: present
+
+    - name: Create app directory
+      file:
+        path: /home/ec2-user/crud-app
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Copy app.py
+      copy:
+        src: files/app.py
+        dest: /home/ec2-user/crud-app/app.py
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Copy requirements.txt
+      copy:
+        src: files/requirements.txt
+        dest: /home/ec2-user/crud-app/requirements.txt
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Install Python dependencies
+      pip:
+        requirements: /home/ec2-user/crud-app/requirements.txt
+        executable: pip3
+
+    - name: Write .env with real DB IPs
+      copy:
+        dest: /home/ec2-user/crud-app/.env
+        owner: ec2-user
+        group: ec2-user
+        content: |
+          DB_USER={{ app_db_user }}
+          DB_PASS={{ app_db_pass }}
+          DB_NAME={{ app_db_name }}
+          DB_PRIMARY_HOST={{ primary_ip }}
+          DB_REPLICA_HOSTS={{ replica_ips }}
+      no_log: true
+
+    - name: Copy systemd service file
+      copy:
+        src: files/crud-app.service
+        dest: /etc/systemd/system/crud-app.service
+
+    - name: Reload systemd, enable and start the app
+      systemd:
+        name: crud-app
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Wait for app to be healthy
+      uri:
+        url: "http://localhost:5000/health"
+        status_code: 200
+      register: health_check
+      retries: 5
+      delay: 3
+      until: health_check.status == 200
+
+    - name: Show health check result
+      debug:
+        msg: "App on {{ inventory_hostname }} is healthy"
