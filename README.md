@@ -2,7 +2,7 @@
 
 A three-tier notes application on AWS, built and automated end to end with Ansible: an Application Load Balancer in front of three Flask servers, MariaDB with one primary and two replicas (writes to the primary, reads spread across the replicas), and a Prometheus / Alertmanager / Grafana monitoring stack.
 
-<img width="1132" height="782" alt="architecture drawio" src="https://github.com/user-attachments/assets/1a43b265-c56e-4d7a-af9a-21991c63c5ff" />
+
 
 
 ## What it demonstrates
@@ -15,7 +15,7 @@ A three-tier notes application on AWS, built and automated end to end with Ansib
 
 ## Architecture
 
-![Request and replication flow](docs/img/arch-request-flow.png)
+<img width="1132" height="782" alt="architecture drawio" src="https://github.com/user-attachments/assets/1a43b265-c56e-4d7a-af9a-21991c63c5ff" />
 
 | Layer | Details |
 |---|---|
@@ -39,7 +39,8 @@ A notes app with a browser UI and a JSON API.
 
 ### Monitoring
 
-![Monitoring architecture](docs/img/arch-monitoring.png)
+<img width="1911" height="937" alt="web-ui" src="https://github.com/user-attachments/assets/ac1be422-1148-4898-b2af-cd40f249bd43" />
+
 
 ## Repository layout
 
@@ -74,14 +75,7 @@ ansible-playbook -i inventory.ini monitoring.yml   # exporters + Prometheus/Aler
 
 ### Load balancer
 
-All three app servers are registered and healthy in the target group:
 
-![Target group health](docs/img/alb-target-health.png)
-
-Refreshing the page shows the serving app server changing as the ALB rotates requests, and the data being read from different replicas:
-
-![Served by app server A](docs/img/lb-served-by-1.png)
-![Served by app server B](docs/img/lb-served-by-2.png)
 
 ### Replication
 
@@ -97,7 +91,8 @@ All scrape targets are up (3 MariaDB, 7 node, plus Prometheus itself):
 
 Dashboards under load (a script sends parallel read and write traffic through the ALB while CPU is burned on one app server):
 
-![Node Exporter dashboard under load](docs/img/grafana-node-exporter.png)
+![Node Exporter dashboard under load]<img width="1911" height="937" alt="grafana" src="https://github.com/user-attachments/assets/2029c4ce-10ad-4a26-b98d-e812c1847a6e" />
+
 ![MySQL dashboard under load](docs/img/grafana-mysql-overview.png)
 
 Stopping `node_exporter` on an app server fires `InstanceDown` after one minute:
