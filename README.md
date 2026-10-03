@@ -2,7 +2,7 @@
 
 A three-tier notes application on AWS, built and automated end to end with Ansible: an Application Load Balancer in front of three Flask servers, MariaDB with one primary and two replicas (writes to the primary, reads spread across the replicas), and a Prometheus / Alertmanager / Grafana monitoring stack.
 
-![Infrastructure](<img width="1132" height="782" alt="architecture drawio" src="https://github.com/user-attachments/assets/1a43b265-c56e-4d7a-af9a-21991c63c5ff" />
+!Infrastructure(<img width="1132" height="782" alt="architecture drawio" src="https://github.com/user-attachments/assets/1a43b265-c56e-4d7a-af9a-21991c63c5ff" />
 
 )
 
